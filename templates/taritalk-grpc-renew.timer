@@ -1,0 +1,11 @@
+# Written by taritalk-node-deploy (unofficial TariTalk community tool).
+[Unit]
+Description=Daily check of the Base Node gRPC TLS certificate (TariTalk Node Tool)
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

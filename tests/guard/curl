@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Network guard for tests: the real curl must never run during the test
+# suite. Tests that exercise downloads put tests/fakes/curl earlier in PATH.
+echo "network guard: real curl is not allowed in tests: $*" >&2
+exit 97

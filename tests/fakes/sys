@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+# Test double for the system commands install uses: apt-get, dpkg-query,
+# getent, groupadd, useradd, userdel, groupdel, systemctl, runuser and tor;
+# and for those only uninstall uses: dpkg and systemd-analyze; and nginx
+# (with the nginx and nginx-common packages, their conffiles and
+# nginx.service) for wallet-query, grpc and uninstall.
+# Installed as symlinks with those names (see tests/test_install.sh); never
+# touches the real system. State lives in $FAKE_SYS; files that real
+# packages and services would create go under $FAKE_SYSROOT.
+#
+# Every call is appended to $FAKE_SYS/calls as "NAME ARGS...".
+#   FAKE_SYS_FAIL   newline-separated globs over "NAME ARGS...": a matching
+#                   call fails (exit 1)
+#   FAKE_SYS_HANG   glob: a matching call records its PID in
+#                   $FAKE_SYS/hang.pid and hangs until killed
+#   FAKE_SYS_HOOK_ON / FAKE_SYS_HOOK
+#                   glob / executable run before a matching call
+#   FAKE_NODE_LISTEN   addresses minotari-mainnet listens on when started
+#                      (default "0.0.0.0:18189 127.0.0.1:9000")
+#   FAKE_TOR_LISTEN    addresses tor@default listens on when started
+#                      (default "127.0.0.1:9050 127.0.0.1:9051")
+#   FAKE_NRESTARTS     NRestarts reported for minotari-mainnet (default 0;
+#                      printed as is, so it may be invalid)
+#   FAKE_NODE_ACTIVE   is-active answer for minotari-mainnet once started
+#   FAKE_NODE_EXE      what /proc/<main pid>/exe points to (default: the
+#                      binary behind /opt/tari/current)
+#   FAKE_NODE_BROKEN   glob over the real path of the binary behind
+#                      /opt/tari/current: a release that matches is broken
+#   FAKE_NODE_BROKEN_MODE  start (default: starting it fails) or listen (it
+#                      starts but never opens its ports)
+#   FAKE_RUNUSER_SETPRIV=1  runuser really drops to the user's UID with
+#                      setpriv (root tests only)
+#   FAKE_TOR_POSTRM_KEEPS=1  purging tor leaves /var/lib/tor, /var/log/tor and
+#                      /run/tor (as an older or changed postrm might)
+#   FAKE_NGINX_POSTRM_KEEPS=1  purging nginx-common leaves /etc/nginx,
+#                      /var/log/nginx and /var/lib/nginx
+#   FAKE_FRAGMENT      FragmentPath reported for a loaded unit (default: its
+#                      file in /etc/systemd/system)
+#   FAKE_NGINX_VERSION what `nginx -v` reports (default 1.22.1, Debian 12's)
+#   FAKE_NODE_GRPC_LISTEN  where minotari-mainnet's gRPC listens when its
+#                      configuration turns gRPC on (default: its grpc_address)
+# `getent ahostsv4 NAME` answers from $FAKE_SYS/dns, lines "NAME IPV4".
+set -u
+name=${0##*/}
+call="$name $*"
+printf '%s\n' "$call" >>"$FAKE_SYS/calls"
+ROOT=$FAKE_SYSROOT
+
+matches() {
+  local pattern
+  while IFS= read -r pattern; do
+    # shellcheck disable=SC2053 # Patterns are globs on purpose.
+    [[ -n $pattern && $call == $pattern ]] && return 0
+  done <<<"$1"
+  return 1
+}
+
+if [[ -n ${FAKE_SYS_HOOK_ON-} ]] && matches "$FAKE_SYS_HOOK_ON"; then
+  "$FAKE_SYS_HOOK" "$call" || exit 99
+fi
+if [[ -n ${FAKE_SYS_FAIL-} ]] && matches "$FAKE_SYS_FAIL"; then
+  printf 'FAILED %s\n' "$call" >>"$FAKE_SYS/calls"
+  echo "$name: simulated failure" >&2
+  exit 1
+fi
+if [[ -n ${FAKE_SYS_HANG-} ]] && matches "$FAKE_SYS_HANG"; then
+  echo "$$" >"$FAKE_SYS/hang.pid"
+  exec sleep 300
+fi
+
+# --- listener table: /proc/net/tcp built from $FAKE_SYS/listeners --------
+# Lines "OWNER ADDRESS:PORT".
+hexaddr() {
+  local ip=${1%:*} port=${1##*:} a b c d
+  IFS=. read -r a b c d <<<"$ip"
+  printf '%02X%02X%02X%02X:%04X' "$d" "$c" "$b" "$a" "$port"
+}
+write_proc_net() {
+  local owner addr n=0
+  {
+    echo '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode'
+    while read -r owner addr; do
+      [[ -n $addr ]] || continue
+      printf '%4d: %s 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 %d 1\n' \
+        "$n" "$(hexaddr "$addr")" "$((1000 + n))"
+      n=$((n + 1))
+    done <"$FAKE_SYS/listeners"
+  } >"$ROOT/proc/net/tcp"
+}
+listen() {
+  local owner=$1 addr
+  shift
+  for addr in "$@"; do printf '%s %s\n' "$owner" "$addr" >>"$FAKE_SYS/listeners"; done
+  write_proc_net
+}
+unlisten() {
+  grep -v "^$1 " "$FAKE_SYS/listeners" >"$FAKE_SYS/listeners.new" || true
+  mv "$FAKE_SYS/listeners.new" "$FAKE_SYS/listeners"
+  write_proc_net
+}
+
+# The unit search path, highest priority first, as `systemd-analyze
+# unit-paths` prints it for the system manager on Debian 13.
+UNIT_PATHS=(/etc/systemd/system.control /run/systemd/system.control /run/systemd/transient
+  /run/systemd/generator.early /etc/systemd/system /etc/systemd/system.attached /run/systemd/system
+  /run/systemd/system.attached /run/systemd/generator /usr/local/lib/systemd/system
+  /usr/lib/systemd/system /lib/systemd/system /run/systemd/generator.late)
+
+# unit_fragment UNIT: the unit file systemd loads (the first in the path).
+unit_fragment() {
+  local dir
+  for dir in "${UNIT_PATHS[@]}"; do
+    [[ -e $ROOT$dir/$1 ]] && {
+      echo "$dir/$1"
+      return 0
+    }
+  done
+  return 1
+}
+
+# unit_dropins UNIT: every drop-in systemd merges into UNIT: UNIT.d, the
+# dash-prefix forms (a-.service.d for a-b.service) and service.d, in every
+# directory of the path.
+unit_dropins() {
+  local dir name prefix=${1%.*} type=${1##*.} f
+  local -a names=("$1.d" "$type.d")
+  while [[ $prefix == *-* ]]; do
+    prefix=${prefix%-*}
+    names+=("$prefix-.$type.d")
+  done
+  for dir in "${UNIT_PATHS[@]}"; do
+    for name in "${names[@]}"; do
+      for f in "$ROOT$dir/$name"/*.conf; do
+        [[ -e $f ]] && printf '%s ' "${f#"$ROOT"}"
+      done
+    done
+  done
+}
+
+db_get() { grep "^$2:" "$FAKE_SYS/$1"; }
+
+# dependents_of PACKAGE: installed packages that depend on PACKAGE
+# ($FAKE_SYS/depends has lines "PACKAGE DEPENDENCY").
+dependents_of() {
+  local pkg dep
+  [[ -e $FAKE_SYS/depends ]] || return 0
+  while read -r pkg dep; do
+    [[ $dep == "$1" ]] && grep -qx "$pkg" "$FAKE_SYS/pkgs" && echo "$pkg"
+  done <"$FAKE_SYS/depends"
+  return 0
+}
+
+# purge_package PACKAGE: what dpkg --purge does, with the Debian tor
+# package's maintainer scripts: Tor stopped and disabled, its conffile
+# removed with /etc/tor if then empty, and its postrm's
+# `rm -rf /var/log/tor/ /var/lib/tor/ /run/tor/`.
+purge_package() {
+  grep -vx "$1" "$FAKE_SYS/pkgs" >"$FAKE_SYS/pkgs.new" || true
+  mv "$FAKE_SYS/pkgs.new" "$FAKE_SYS/pkgs"
+  case "$1" in
+    nginx)
+      # The nginx package: its service stops with it.
+      unit_stop nginx.service
+      rm -f "$FAKE_SYS/enabled.nginx.service"
+      return 0
+      ;;
+    nginx-common)
+      # nginx-common's postrm on purge: rm -rf /var/lib/nginx /var/log/nginx /etc/nginx.
+      [[ -n ${FAKE_NGINX_POSTRM_KEEPS-} ]] || rm -rf "$ROOT/etc/nginx" "$ROOT/var/log/nginx" "$ROOT/var/lib/nginx"
+      rm -rf "$FAKE_SYS/nginx-conffiles"
+      return 0
+      ;;
+  esac
+  [[ $1 == tor ]] || return 0
+  unit_stop tor.service
+  rm -f "$FAKE_SYS/enabled.tor.service" "$ROOT/etc/tor/torrc"
+  rmdir "$ROOT/etc/tor" 2>/dev/null || true
+  [[ -n ${FAKE_TOR_POSTRM_KEEPS-} ]] || rm -rf "$ROOT/var/log/tor" "$ROOT/var/lib/tor" "$ROOT/run/tor"
+}
+db_del() {
+  grep -v "^$2:" "$FAKE_SYS/$1" >"$FAKE_SYS/$1.new" || true
+  mv "$FAKE_SYS/$1.new" "$FAKE_SYS/$1"
+}
+
+# process PID COMM UID: a fake running process under $ROOT/proc.
+process() {
+  mkdir -p "$ROOT/proc/$1"
+  echo "$2" >"$ROOT/proc/$1/comm"
+  printf 'Name:\t%s\nUid:\t%s\t%s\t%s\t%s\n' "$2" "$3" "$3" "$3" "$3" >"$ROOT/proc/$1/status"
+}
+
+unit_start() {
+  local unit=$1 uid
+  case "$unit" in
+    minotari-mainnet.service)
+      grep -qx "$unit" "$FAKE_SYS/loaded" 2>/dev/null || {
+        echo "Failed to start $unit: Unit $unit not found." >&2
+        exit 5
+      }
+      bin=$(realpath "$ROOT/opt/tari/current/minotari_node" 2>/dev/null) || bin=''
+      # shellcheck disable=SC2053 # FAKE_NODE_BROKEN is a glob on purpose.
+      if [[ -n ${FAKE_NODE_BROKEN-} && $bin == $FAKE_NODE_BROKEN ]]; then
+        if [[ ${FAKE_NODE_BROKEN_MODE:-start} == start ]]; then
+          echo "Job for $unit failed because the control process exited with error code." >&2
+          exit 1
+        fi
+        FAKE_NODE_LISTEN=''
+      fi
+      uid=$(cut -d: -f3 <<<"$(db_get passwd tari)")
+      process 4242 minotari_node "$uid"
+      ln -sfn "${FAKE_NODE_EXE:-$(realpath "$ROOT/opt/tari/current/minotari_node")}" "$ROOT/proc/4242/exe"
+      echo 4242 >"$FAKE_SYS/mainpid"
+      # shellcheck disable=SC2086 # Space-separated address list.
+      listen node ${FAKE_NODE_LISTEN-0.0.0.0:18189 127.0.0.1:9000}
+      # gRPC, when its configuration turns it on (on its grpc_address).
+      cfg=$ROOT/var/lib/tari/mainnet/mainnet/config/config.toml
+      if grep -qx 'grpc_enabled = true' "$cfg" 2>/dev/null; then
+        grpc=$(sed -n 's|^grpc_address = "/ip4/\([0-9.]*\)/tcp/\([0-9]*\)"$|\1:\2|p' "$cfg")
+        # shellcheck disable=SC2086 # Space-separated address list.
+        listen node ${FAKE_NODE_GRPC_LISTEN-${grpc:-127.0.0.1:18142}}
+      fi
+      ;;
+    tor@default.service)
+      process 4343 tor 4100
+      # shellcheck disable=SC2086 # Space-separated address list.
+      if grep -q '^ControlPort 127.0.0.1:9051' "$ROOT/etc/tor/torrc"; then
+        listen tor ${FAKE_TOR_LISTEN-127.0.0.1:9050 127.0.0.1:9051}
+      else
+        listen tor 127.0.0.1:9050
+      fi
+      ;;
+    tor.service) ;;
+    nginx.service)
+      grep -qx nginx "$FAKE_SYS/pkgs" || {
+        echo "Failed to start $unit: Unit $unit not found." >&2
+        exit 5
+      }
+      unlisten nginx
+      if grep -qs 'listen 443' "$ROOT"/etc/nginx/conf.d/*.conf; then
+        listen nginx 0.0.0.0:80 0.0.0.0:443
+      else
+        listen nginx 0.0.0.0:80
+      fi
+      ;;
+    *.timer)
+      grep -qx "$unit" "$FAKE_SYS/loaded" 2>/dev/null || {
+        echo "Failed to start $unit: Unit $unit not found." >&2
+        exit 5
+      }
+      ;;
+    *)
+      echo "Failed to start $unit: Unit $unit not found." >&2
+      exit 5
+      ;;
+  esac
+  touch "$FAKE_SYS/active.$unit"
+}
+
+unit_stop() {
+  case "$1" in
+    minotari-mainnet.service)
+      rm -rf "$ROOT/proc/4242" "$FAKE_SYS/mainpid"
+      unlisten node
+      ;;
+    tor@default.service)
+      rm -rf "$ROOT/proc/4343"
+      unlisten tor
+      ;;
+    nginx.service) unlisten nginx ;;
+    tor.service)
+      # PartOf=tor.service: stopping it stops the instances.
+      rm -rf "$ROOT/proc/4343"
+      unlisten tor
+      rm -f "$FAKE_SYS/active.tor@default.service"
+      ;;
+  esac
+  rm -f "$FAKE_SYS/active.$1"
+}
+
+case "$name" in
+  dpkg-query)
+    # dpkg-query -W -f='${Status}' PKG; -W -f='${Conffiles}\n' PKG...;
+    # -L PKG... (the files the fake nginx packages "install").
+    if [[ $1 == -L ]]; then
+      shift
+      for pkg in "$@"; do
+        grep -qx "$pkg" "$FAKE_SYS/pkgs" || {
+          echo "dpkg-query: package '$pkg' is not installed" >&2
+          exit 1
+        }
+        case "$pkg" in
+          nginx-common)
+            printf '%s\n' /etc/nginx /etc/nginx/conf.d /etc/nginx/nginx.conf /etc/nginx/sites-available \
+              /etc/nginx/sites-available/default /etc/nginx/sites-enabled /var/log/nginx /var/lib/nginx
+            ;;
+          nginx) printf '%s\n' /usr/sbin /usr/sbin/nginx ;;
+        esac
+      done
+      exit 0
+    fi
+    # shellcheck disable=SC2016 # dpkg-query's literal format.
+    if [[ $1 == -W && $2 == '-f=${Conffiles}'* ]]; then
+      shift 2
+      for pkg in "$@"; do
+        grep -qx "$pkg" "$FAKE_SYS/pkgs" || {
+          echo "dpkg-query: no packages found matching $pkg" >&2
+          exit 1
+        }
+        if [[ $pkg == nginx-common && -d $FAKE_SYS/nginx-conffiles ]]; then
+          printf ' /etc/nginx/nginx.conf %s\n /etc/nginx/sites-available/default %s' \
+            "$(md5sum <"$FAKE_SYS/nginx-conffiles/nginx.conf" | cut -c1-32)" \
+            "$(md5sum <"$FAKE_SYS/nginx-conffiles/default" | cut -c1-32)"
+        fi
+        printf '\n'
+      done
+      exit 0
+    fi
+    pkg=${!#}
+    if grep -qx "$pkg" "$FAKE_SYS/pkgs"; then
+      printf 'install ok installed'
+    else
+      echo "dpkg-query: no packages found matching $pkg" >&2
+      exit 1
+    fi
+    ;;
+  apt-get)
+    [[ ${DEBIAN_FRONTEND-} == noninteractive ]] || {
+      echo "fake apt-get: DEBIAN_FRONTEND must be noninteractive" >&2
+      exit 100
+    }
+    sub=''
+    pkgs=()
+    after_dashdash=0
+    simulate=0
+    for a in "$@"; do
+      if ((after_dashdash)); then
+        pkgs+=("$a")
+        continue
+      fi
+      case "$a" in
+        update | install | purge) sub=$a ;;
+        -s) simulate=1 ;;
+        --) after_dashdash=1 ;;
+      esac
+    done
+    if [[ $sub == purge ]]; then
+      # Like apt: the packages that depend on one purged go with it.
+      for p in "${pkgs[@]}"; do
+        grep -qx "$p" "$FAKE_SYS/pkgs" || {
+          echo "E: Unable to locate package $p" >&2
+          exit 100
+        }
+        mapfile -t -O "${#pkgs[@]}" pkgs < <(dependents_of "$p")
+      done
+      if ((simulate)); then
+        printf 'Purg %s [1.0-1]\n' "${pkgs[@]}"
+        exit 0
+      fi
+      for p in "${pkgs[@]}"; do
+        purge_package "$p"
+      done
+      exit 0
+    fi
+    [[ $sub == install ]] || exit 0
+    for p in "${pkgs[@]}"; do
+      echo "$p" >>"$FAKE_SYS/pkgs"
+      if [[ $p == tor ]]; then
+        # What the Debian package does: account, directories, default
+        # configuration, and Tor started with it.
+        grep -q '^debian-tor:' "$FAKE_SYS/passwd" ||
+          echo "debian-tor:x:4100:4100::/var/lib/tor:/bin/false" >>"$FAKE_SYS/passwd"
+        grep -q '^debian-tor:' "$FAKE_SYS/group" || echo "debian-tor:x:4100:" >>"$FAKE_SYS/group"
+        mkdir -p "$ROOT/etc/tor" "$ROOT/var/lib/tor" "$ROOT/var/log/tor"
+        printf '## default Debian torrc (everything commented out)\n#SocksPort 9050\n' >"$ROOT/etc/tor/torrc"
+        touch "$FAKE_SYS/enabled.tor.service"
+        unit_start tor.service
+        unit_start tor@default.service
+      fi
+      if [[ $p == nginx ]]; then
+        # What the Debian packages do: nginx-common comes as a dependency
+        # with /etc/nginx (its conffiles, kept as installed for dpkg's
+        # Conffiles md5sums) and a default site; Nginx started and enabled.
+        grep -qx nginx-common "$FAKE_SYS/pkgs" || echo nginx-common >>"$FAKE_SYS/pkgs"
+        mkdir -p "$ROOT/etc/nginx/conf.d" "$ROOT/etc/nginx/sites-available" \
+          "$ROOT/etc/nginx/sites-enabled" "$ROOT/var/log/nginx" "$FAKE_SYS/nginx-conffiles"
+        printf 'http {\n\tinclude /etc/nginx/conf.d/*.conf;\n\tinclude /etc/nginx/sites-enabled/*;\n}\n' \
+          >"$ROOT/etc/nginx/nginx.conf"
+        printf 'server {\n\tlisten 80 default_server;\n}\n' >"$ROOT/etc/nginx/sites-available/default"
+        cp "$ROOT/etc/nginx/nginx.conf" "$FAKE_SYS/nginx-conffiles/nginx.conf"
+        cp "$ROOT/etc/nginx/sites-available/default" "$FAKE_SYS/nginx-conffiles/default"
+        ln -s /etc/nginx/sites-available/default "$ROOT/etc/nginx/sites-enabled/default"
+        touch "$FAKE_SYS/enabled.nginx.service"
+        unit_start nginx.service
+      fi
+    done
+    ;;
+  getent)
+    # Without a key: the whole database.
+    if (($# == 1)); then
+      cat "$FAKE_SYS/$1"
+      exit 0
+    fi
+    if [[ $1 == ahostsv4 ]]; then
+      found=0
+      while read -r host addr; do
+        [[ $host == "$2" ]] || continue
+        printf '%-15s STREAM %s\n%-15s DGRAM\n%-15s RAW\n' "$addr" "$2" "$addr" "$addr"
+        found=1
+      done <"$FAKE_SYS/dns" 2>/dev/null
+      ((found)) || exit 2
+      exit 0
+    fi
+    db_get "$1" "$2" || exit 2
+    ;;
+  groupadd)
+    db_get group "${!#}" >/dev/null && exit 9
+    echo "${!#}:x:$FAKE_TEST_GID:" >>"$FAKE_SYS/group"
+    ;;
+  useradd)
+    db_get passwd "${!#}" >/dev/null && exit 9
+    echo "${!#}:x:$FAKE_TEST_UID:$FAKE_TEST_GID::/var/lib/tari:/usr/sbin/nologin" >>"$FAKE_SYS/passwd"
+    sed -i "s/^debian-tor:x:4100:\$/debian-tor:x:4100:${!#}/" "$FAKE_SYS/group"
+    ;;
+  userdel)
+    db_get passwd "$1" >/dev/null || exit 6
+    db_del passwd "$1"
+    sed -i "s/^debian-tor:x:4100:$1\$/debian-tor:x:4100:/" "$FAKE_SYS/group"
+    ;;
+  groupdel)
+    entry=$(db_get group "$1") || exit 6
+    # Like the real groupdel: never the primary group of an existing user
+    # (supplementary members simply lose the group).
+    if cut -d: -f4 "$FAKE_SYS/passwd" | grep -qx "$(cut -d: -f3 <<<"$entry")"; then
+      echo "groupdel: cannot remove the primary group of an existing user" >&2
+      exit 8
+    fi
+    db_del group "$1"
+    ;;
+  systemctl)
+    sub=$1
+    shift
+    case "$sub" in
+      daemon-reload)
+        : >"$FAKE_SYS/loaded"
+        for d in "${UNIT_PATHS[@]}"; do
+          for f in "$ROOT$d"/*.service "$ROOT$d"/*.timer; do
+            [[ -f $f ]] || continue
+            basename "$f" >>"$FAKE_SYS/loaded"
+          done
+        done
+        sort -u -o "$FAKE_SYS/loaded" "$FAKE_SYS/loaded"
+        ;;
+      enable)
+        [[ $1 == tor@default.service ]] && {
+          echo "The unit files have no installation config (WantedBy=, RequiredBy=, ...)." >&2
+          exit 0
+        }
+        touch "$FAKE_SYS/enabled.$1"
+        ;;
+      disable) rm -f "$FAKE_SYS/enabled.$1" ;;
+      start) unit_start "$1" ;;
+      restart)
+        unit_stop "$1"
+        unit_start "$1"
+        ;;
+      reload)
+        [[ -e $FAKE_SYS/active.$1 ]] || {
+          echo "$1 is not active, cannot reload." >&2
+          exit 1
+        }
+        unit_start "$1"
+        ;;
+      stop) unit_stop "$1" ;;
+      is-active)
+        if [[ $1 == minotari-mainnet.service && -e $FAKE_SYS/active.$1 && -n ${FAKE_NODE_ACTIVE-} ]]; then
+          echo "$FAKE_NODE_ACTIVE"
+          exit 3
+        fi
+        if [[ -e $FAKE_SYS/active.$1 ]]; then echo active; else
+          echo inactive
+          exit 3
+        fi
+        ;;
+      is-enabled)
+        if [[ $1 == tor@default.service ]]; then echo static; elif [[ -e $FAKE_SYS/enabled.$1 ]]; then echo enabled; else
+          echo disabled
+          exit 1
+        fi
+        ;;
+      show)
+        # show -p PROPERTY --value UNIT, or show UNIT -p PROPERTY --value
+        prop='' unit=
+        while (($# > 0)); do
+          case "$1" in
+            -p) prop=$2 ;;
+            *.service | *.timer) unit=$1 ;;
+          esac
+          shift
+        done
+        case "$prop" in
+          NRestarts) echo "${FAKE_NRESTARTS:-0}" ;;
+          FragmentPath)
+            if grep -qx "$unit" "$FAKE_SYS/loaded" 2>/dev/null; then
+              echo "${FAKE_FRAGMENT-$(unit_fragment "$unit")}"
+            else
+              echo
+            fi
+            ;;
+          DropInPaths)
+            if grep -qx "$unit" "$FAKE_SYS/loaded" 2>/dev/null; then unit_dropins "$unit"; fi
+            echo
+            ;;
+          LoadState)
+            if grep -qx "$unit" "$FAKE_SYS/loaded" 2>/dev/null; then echo loaded; else echo not-found; fi
+            ;;
+          MainPID)
+            if [[ $unit == tor@default.service ]]; then
+              if [[ -e $FAKE_SYS/active.$unit ]]; then echo 4343; else echo 0; fi
+            else
+              cat "$FAKE_SYS/mainpid" 2>/dev/null || echo 0
+            fi
+            ;;
+          ExecStart) echo "{ path=/opt/tari/current/minotari_node ; argv[]=/opt/tari/current/minotari_node --base-path /var/lib/tari/mainnet ; }" ;;
+        esac
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  runuser)
+    [[ $1 == -u && $3 == -- ]] || {
+      echo "fake runuser: expected -u USER -- CMD" >&2
+      exit 1
+    }
+    user=$2
+    shift 3
+    # Commands run with `env -i`: keep the fakes' FAKE_* settings.
+    if [[ $1 == env && $2 == -i ]]; then
+      shift 2
+      keep=()
+      for v in $(compgen -e); do
+        [[ $v == FAKE_* ]] && keep+=("$v=${!v}")
+      done
+      set -- env -i "${keep[@]}" "$@"
+    fi
+    if [[ ${FAKE_RUNUSER_SETPRIV-} == 1 ]]; then
+      entry=$(db_get passwd "$user") || exit 1
+      IFS=: read -r _ _ uid gid _ <<<"$entry"
+      exec setpriv --reuid="$uid" --regid="$gid" --clear-groups "$@"
+    fi
+    exec "$@"
+    ;;
+  dpkg)
+    # dpkg [--no-act] --purge -- PACKAGE...: never removes another package;
+    # refuses while an installed package (other than one named) depends on
+    # a PACKAGE.
+    noact=0
+    [[ $1 != --no-act ]] || {
+      noact=1
+      shift
+    }
+    [[ $# -ge 3 && $1 == --purge && $2 == -- ]] || exit 2
+    shift 2
+    pkgs=()
+    for pkg in "$@"; do
+      if grep -qx "$pkg" "$FAKE_SYS/pkgs"; then
+        pkgs+=("$pkg")
+      else
+        echo "dpkg: warning: ignoring request to remove $pkg which isn't installed" >&2
+      fi
+    done
+    for pkg in "${pkgs[@]}"; do
+      deps=$(dependents_of "$pkg")
+      for p in $deps; do
+        [[ " ${pkgs[*]} " == *" $p "* ]] && continue
+        printf 'dpkg: dependency problems prevent removal of %s:\n %s depends on %s.\n' "$pkg" "$p" "$pkg" >&2
+        exit 1
+      done
+    done
+    ((noact)) && exit 0
+    for pkg in "${pkgs[@]}"; do
+      purge_package "$pkg"
+    done
+    ;;
+  systemd-analyze)
+    [[ $* == unit-paths ]] || exit 1
+    printf '%s\n' "${UNIT_PATHS[@]}"
+    ;;
+  nginx)
+    case "$*" in
+      -v) echo "nginx version: nginx/${FAKE_NGINX_VERSION:-1.22.1}" >&2 ;;
+      "-t -q")
+        # Like nginx -t for what the tool writes: no placeholder left,
+        # balanced braces, and only one default server per port.
+        n=0
+        for f in "$ROOT"/etc/nginx/conf.d/*.conf "$ROOT"/etc/nginx/sites-enabled/*; do
+          [[ -e $f ]] || continue
+          ! grep -qE '@[A-Z0-9_]+@' "$f" || {
+            echo "nginx: [emerg] unknown directive in $f" >&2
+            exit 1
+          }
+          [[ $(tr -cd '{' <"$f" | wc -c) == $(tr -cd '}' <"$f" | wc -c) ]] || {
+            echo "nginx: [emerg] unexpected end of file in $f" >&2
+            exit 1
+          }
+          n=$((n + $(grep -c 'listen 80 default_server' "$f")))
+          n443=$((${n443:-0} + $(grep -c 'listen 443 .*default_server' "$f")))
+        done
+        ((n <= 1 && ${n443:-0} <= 1)) || {
+          echo "nginx: [emerg] a duplicate default server" >&2
+          exit 1
+        }
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  tor)
+    # tor --verify-config -f FILE
+    [[ $1 == --verify-config && $2 == -f && -f $3 ]] || exit 1
+    cp "$3" "$FAKE_SYS/verified-torrc"
+    echo "Configuration was valid"
+    ;;
+  *)
+    echo "fake sys: unknown command $name" >&2
+    exit 1
+    ;;
+esac

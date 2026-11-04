@@ -1,0 +1,31 @@
+# taritalk-nodes-submit: takes one-time node submissions from the installer
+# (POST /submit) and from the website's registration form (POST /web-submit)
+# and stores them as pending rows in its own D1 database. Separate from the
+# status Worker and its NODES_STATUS KV; it reads nothing of theirs and
+# offers no public read, list or administration route. Valid submission
+# attempts are accepted once per observed source IP per minute.
+#
+# The website route checks its Turnstile token with Cloudflare using the
+# secret TURNSTILE_SECRET, set with `wrangler secret put TURNSTILE_SECRET`
+# and never written here.
+name = "taritalk-nodes-submit"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "taritalk-nodes-submissions"
+# The ID that `wrangler d1 create taritalk-nodes-submissions` prints; set by
+# the operator when deploying. Not a secret, but not known before creation.
+database_id = "REPLACE_WITH_THE_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# Workers Rate Limiting (needs Wrangler 4.36 or later): one valid submission
+# attempt per observed source IP per 60 seconds, counted per Cloudflare
+# location and eventually consistent; a brake, not an exact ledger. The
+# namespace_id is this Worker's own; bindings sharing an ID share counters.
+[[ratelimits]]
+name = "SUBMIT_RATE_LIMIT"
+namespace_id = "7001"
+simple = { limit = 1, period = 60 }

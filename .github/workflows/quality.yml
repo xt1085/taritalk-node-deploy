@@ -1,0 +1,159 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    name: Ubuntu 24.04 (tests, ShellCheck, shfmt)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SHELLCHECK_VERSION: 0.9.0
+      # Root-only tests (fetch must refuse root) run via sudo; never skip them.
+      TARITALK_REQUIRE_ROOT_TESTS: "1"
+      SHFMT_VERSION: v3.10.0
+      SHFMT_SHA256: 1f57a384d59542f8fac5f503da1f3ea44242f46dff969569e80b524d64b71dbc
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # ShellCheck comes from the runner image; fail if it drifts from the
+      # version documented in README.md rather than silently changing gates.
+      - name: Verify ShellCheck version
+        run: |
+          actual=$(shellcheck --version | sed -n 's/^version: //p')
+          echo "ShellCheck ${actual}"
+          if [ "$actual" != "$SHELLCHECK_VERSION" ]; then
+            echo "::error::expected ShellCheck ${SHELLCHECK_VERSION}, got ${actual}"
+            exit 1
+          fi
+
+      - name: Install shfmt (pinned version, checksum verified)
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools"
+          curl -fsSL -o "$RUNNER_TEMP/tools/shfmt" \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          echo "${SHFMT_SHA256}  $RUNNER_TEMP/tools/shfmt" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/tools/shfmt"
+          echo "$RUNNER_TEMP/tools" >>"$GITHUB_PATH"
+
+      # Tests build small synthetic release ZIPs and run a local 127.0.0.1
+      # HTTPS server; no Tari or GitHub API downloads.
+      - name: Show test tools
+        run: |
+          zip -v | sed -n 2p
+          unzip -v | sed -n 1p
+          jq --version
+          python3 --version
+          openssl version
+          curl --version | sed -n 1p
+          command -v setsid
+          sudo -n true && echo "passwordless sudo: available"
+
+      # Behavioral tests, ShellCheck and shfmt, once each.
+      - name: All quality gates
+        run: scripts/check.sh
+
+  ubuntu-2604:
+    name: Ubuntu 26.04 x64 (tests, ShellCheck, shfmt)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      # The Ubuntu 26.04 image ships ShellCheck 0.11.0; this job pins that
+      # version just as the Ubuntu 24.04 job pins 0.9.0 (both must pass).
+      SHELLCHECK_VERSION: 0.11.0
+      TARITALK_REQUIRE_ROOT_TESTS: "1"
+      SHFMT_VERSION: v3.10.0
+      SHFMT_SHA256: 1f57a384d59542f8fac5f503da1f3ea44242f46dff969569e80b524d64b71dbc
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Verify ShellCheck version
+        run: |
+          actual=$(shellcheck --version | sed -n 's/^version: //p')
+          echo "ShellCheck ${actual}"
+          if [ "$actual" != "$SHELLCHECK_VERSION" ]; then
+            echo "::error::expected ShellCheck ${SHELLCHECK_VERSION}, got ${actual}"
+            exit 1
+          fi
+
+      - name: Install shfmt (pinned version, checksum verified)
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools"
+          curl -fsSL -o "$RUNNER_TEMP/tools/shfmt" \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          echo "${SHFMT_SHA256}  $RUNNER_TEMP/tools/shfmt" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/tools/shfmt"
+          echo "$RUNNER_TEMP/tools" >>"$GITHUB_PATH"
+
+      - name: Show platform and test tools
+        run: |
+          sed -n 's/^PRETTY_NAME=//p' /etc/os-release
+          zip -v | sed -n 2p
+          unzip -v | sed -n 1p
+          jq --version
+          python3 --version
+          openssl version
+          curl --version | sed -n 1p
+          command -v setsid
+          sudo -n true && echo "passwordless sudo: available"
+
+      - name: All quality gates
+        run: scripts/check.sh
+
+  debian:
+    name: ${{ matrix.name }} (behavioral tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debian 12
+            image: debian:bookworm-20260918@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26
+          - name: Debian 13
+            image: debian:trixie-20260918@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c
+    # Runs as root inside the container: root-only tests run directly, the
+    # others as an unprivileged user (see tests/run.sh); none may be skipped.
+    container:
+      image: ${{ matrix.image }}
+    env:
+      TARITALK_REQUIRE_ROOT_TESTS: "1"
+    steps:
+      - name: Install runtime and test tools (Debian packages)
+        run: |
+          apt-get update
+          extra=
+          if apt-cache show setpriv >/dev/null 2>&1; then extra=setpriv; fi
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git curl jq unzip zip python3 openssl util-linux $extra
+
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Show platform and tool versions
+        run: |
+          sed -n 's/^PRETTY_NAME=//p' /etc/os-release
+          bash --version | sed -n 1p
+          curl --version | sed -n 1p
+          openssl version
+          python3 --version
+          jq --version
+          zip -v | sed -n 2p
+          unzip -v | sed -n 1p
+          command -v setpriv setsid timeout
+
+      - name: Behavioral tests
+        run: scripts/test.sh

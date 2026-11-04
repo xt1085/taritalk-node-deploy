@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""A `timeout` that, like uutils timeout 0.10 (Ubuntu 26.04), runs COMMAND in
+its own process group, passes TERM on to that group and waits for COMMAND,
+but answers INT or HUP by killing the whole group at once (COMMAND gets no
+chance to clean up). Usage, as the tool calls it: [--kill-after=N] SECONDS
+COMMAND... (the limits are not modelled; tests stop COMMAND by signal)."""
+import os
+import signal
+import subprocess
+import sys
+
+args = sys.argv[1:]
+while args and args[0].startswith("--"):
+    args.pop(0)
+os.setpgid(0, 0)
+child = subprocess.Popen(args[1:])
+
+
+def on_term(_sig, _frame):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    os.killpg(0, signal.SIGTERM)
+
+
+def on_int_or_hup(_sig, _frame):
+    os.killpg(0, signal.SIGKILL)
+
+
+signal.signal(signal.SIGTERM, on_term)
+signal.signal(signal.SIGINT, on_int_or_hup)
+signal.signal(signal.SIGHUP, on_int_or_hup)
+child.wait()
+sys.exit(124 if child.returncode < 0 else child.returncode)

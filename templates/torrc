@@ -1,0 +1,8 @@
+# Tor configuration written by taritalk-node-deploy for the local Minotari
+# node: SOCKS and control ports on loopback only. Not a relay.
+SocksPort 127.0.0.1:9050
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+CookieAuthFileGroupReadable 1
+DataDirectory /var/lib/tor
+Log notice syslog

@@ -1,0 +1,159 @@
+# Minotari base node logging written by taritalk-node-deploy, based on
+# the log4rs_sample.yml of minotari_node. Console: warnings and errors only.
+# Files: /var/log/tari/log/base_node/, rotated at 10 MiB, 5 kept.
+refresh_rate: 30 seconds
+appenders:
+  stdout:
+    kind: console
+    encoder:
+      pattern: "{d(%H:%M)} {h({l}):5} {m}{n}"
+    filters:
+      - kind: threshold
+        level: warn
+  network:
+    kind: rolling_file
+    path: "/var/log/tari/log/base_node/network.log"
+    policy:
+      kind: compound
+      trigger:
+        kind: size
+        limit: 10mb
+      roller:
+        kind: fixed_window
+        base: 1
+        count: 5
+        pattern: "/var/log/tari/log/base_node/network.{}.log"
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S.%f)} [{t}] {l:5} {m}{n}"
+  message_logging:
+    kind: rolling_file
+    path: "/var/log/tari/log/base_node/messages.log"
+    policy:
+      kind: compound
+      trigger:
+        kind: size
+        limit: 10mb
+      roller:
+        kind: fixed_window
+        base: 1
+        count: 5
+        pattern: "/var/log/tari/log/base_node/messages.{}.log"
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S.%f)} [{t}] {l:5} {m}{n}"
+  base_layer:
+    kind: rolling_file
+    path: "/var/log/tari/log/base_node/base_layer.log"
+    policy:
+      kind: compound
+      trigger:
+        kind: size
+        limit: 10mb
+      roller:
+        kind: fixed_window
+        base: 1
+        count: 5
+        pattern: "/var/log/tari/log/base_node/base_layer.{}.log"
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S.%f)} [{t}] {l:5} {m}{n}"
+  grpc:
+    kind: rolling_file
+    path: "/var/log/tari/log/base_node/grpc.log"
+    policy:
+      kind: compound
+      trigger:
+        kind: size
+        limit: 10mb
+      roller:
+        kind: fixed_window
+        base: 1
+        count: 5
+        pattern: "/var/log/tari/log/base_node/grpc.{}.log"
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S.%f)} [{t}] {l:5} {m}{n}"
+  other:
+    kind: rolling_file
+    path: "/var/log/tari/log/base_node/other.log"
+    policy:
+      kind: compound
+      trigger:
+        kind: size
+        limit: 10mb
+      roller:
+        kind: fixed_window
+        base: 1
+        count: 5
+        pattern: "/var/log/tari/log/base_node/other.{}.log"
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S.%f)} [{t}] {l:5} {m}{n}"
+root:
+  level: warn
+  appenders:
+    - stdout
+loggers:
+  tari::application:
+    level: debug
+    appenders:
+      - base_layer
+      - network
+      - other
+    additive: false
+  minotari::base_node::grpc:
+    level: debug
+    appenders:
+      - grpc
+      - stdout
+    additive: false
+  c:
+    level: info
+    appenders:
+      - base_layer
+  minotari:
+    level: debug
+    appenders:
+      - base_layer
+  wallet:
+    level: debug
+    appenders:
+      - base_layer
+  comms:
+    level: debug
+    appenders:
+      - network
+  p2p:
+    level: debug
+    appenders:
+      - network
+  yamux:
+    level: info
+    appenders:
+      - network
+  mio:
+    level: error
+    appenders:
+      - network
+  rustyline:
+    level: error
+    appenders:
+      - other
+    additive: false
+  tokio_util:
+    level: error
+    appenders:
+      - other
+  pgp:
+    level: warn
+    appenders:
+      - other
+  tari_mm_proxy:
+    level: info
+    appenders:
+      - base_layer
+  r2d2:
+    level: warn
+    appenders:
+      - other
+    additive: false
+  comms::middleware::message_logging:
+    level: warn
+    appenders:
+      - message_logging

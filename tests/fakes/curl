@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Test double for curl.
+#
+# Records each invocation's argv, with argument boundaries preserved, as
+# NUL-terminated strings in "$FAKE_CURL_LOG_DIR/<n>" (n = 1, 2, ...).
+# Serves "$FAKE_WEB_ROOT/<host>/<path>" for the URL given after "--"
+# (https://<host>/<path>, the loopback Wallet Query
+# http://127.0.0.1:9000/<path>, or an ACME challenge
+# http://<host>/.well-known/acme-challenge/<name>) to the --output file, or
+# to stdout without one.
+# For gRPC calls (POST .../tari.rpc.BaseNode/METHOD over HTTP/2: to the
+# node at http://127.0.0.1:18142 with --http2-prior-knowledge, or through
+# Nginx at https://HOST with --http2), answers as the node would, from the
+# sandbox ($FAKE_SYSROOT): the node must listen there, and through Nginx
+# a conf.d file must serve HOST with grpc_pass to it while Nginx listens on
+# 443; METHOD is allowed (gRPC status 0) only if listed in the node's
+# grpc_server_allow_methods, else refused (7, PERMISSION_DENIED). The
+# status is in the trailers of --dump-header, as with a real curl.
+# A missing file fails like HTTP 404 with --fail (exit 22). Emulates
+# --dump-header FILE (a plain 200/404 status line),
+# --write-out '%{stderr}%{http_code}\n' and --write-out '%{http_code}'.
+# A POST body given as --data-binary @FILE is copied to
+# "$FAKE_CURL_LOG_DIR/<n>.body".
+#
+# Optional behavior, selected by the URL's last path component:
+#   FAKE_CURL_FAIL_NAME     exit with FAKE_CURL_FAIL_CODE (default 22)
+#   FAKE_CURL_PARTIAL_NAME  send the first 10 bytes, then exit 18 (partial)
+#   FAKE_CURL_SLEEP_NAME    record the pid in "$FAKE_CURL_LOG_DIR/sleep.pid"
+#                           and hang (exec sleep) until killed
+#   FAKE_CURL_HOOK_NAME     run the executable FAKE_CURL_HOOK first (in the
+#                           caller's working directory)
+set -u
+# The test creates FAKE_CURL_LOG_DIR; this fake uses no mkdir so sandboxed
+# runs that trace mkdir stay clean.
+n=1
+while [[ -e $FAKE_CURL_LOG_DIR/$n ]]; do n=$((n + 1)); done
+printf '%s\0' "$@" >"$FAKE_CURL_LOG_DIR/$n"
+orig_args=("$@")
+
+out='' url='' write_out='' headers='' body=''
+while (($# > 0)); do
+  case "$1" in
+    --output)
+      out=$2
+      shift 2
+      ;;
+    --data-binary)
+      body=$2
+      shift 2
+      ;;
+    --dump-header)
+      headers=$2
+      shift 2
+      ;;
+    --write-out)
+      write_out=$2
+      shift 2
+      ;;
+    --)
+      url=${2-}
+      break
+      ;;
+    *) shift ;;
+  esac
+done
+if [[ $url != https://* && $url != http://127.0.0.1:9000/* && $url != http://*/.well-known/acme-challenge/* &&
+  $url != http://127.0.0.1:18142/* ]]; then
+  echo "fake curl: expected '-- https://...', '-- http://127.0.0.1:9000/...', '-- http://127.0.0.1:18142/...' or an ACME challenge URL as the last arguments" >&2
+  exit 2
+fi
+name=${url##*/}
+path=$FAKE_WEB_ROOT/${url#*://}
+[[ $body != @* ]] || cat -- "${body#@}" >"$FAKE_CURL_LOG_DIR/$n.body"
+
+# emit_write_out CODE: the status line and the write-out a real curl gives.
+emit_write_out() {
+  [[ -n $headers ]] && printf 'HTTP/1.1 %s X\r\n\r\n' "$1" >"$headers"
+  [[ $write_out == '%{stderr}%{http_code}\n' ]] && printf '%s\n' "$1" >&2
+  [[ $write_out == '%{http_code}' ]] && printf '%s' "$1"
+  return 0
+}
+send() {
+  if [[ -n $out ]]; then cat -- "$@" >"$out"; else cat -- "$@"; fi
+}
+
+# grpc_answer: the fake node's answer to a gRPC call (see above).
+grpc_answer() {
+  local host=${url#*://} method=$name snake cfg=$FAKE_SYSROOT/var/lib/tari/mainnet/mainnet/config/config.toml
+  local joined=" ${*} " code=7 f served=0
+  host=${host%%/*}
+  if [[ $url == http://* ]]; then
+    [[ $joined == *" --http2-prior-knowledge "* ]] || exit 2
+  else
+    [[ $joined == *" --http2 "* ]] || exit 2
+    for f in "$FAKE_SYSROOT"/etc/nginx/conf.d/*.conf; do
+      grep -q "server_name $host;" "$f" 2>/dev/null &&
+        grep -q 'grpc_pass grpc://127.0.0.1:18142;' "$f" && served=1
+    done
+    grep -qx 'nginx 0.0.0.0:443' "$FAKE_SYS/listeners" || served=0
+    ((served)) || {
+      echo "curl: (7) Failed to connect to $host port 443" >&2
+      exit 7
+    }
+  fi
+  grep -qx 'node 127.0.0.1:18142' "$FAKE_SYS/listeners" || {
+    if [[ $url == http://* ]]; then
+      echo "curl: (7) Failed to connect to 127.0.0.1 port 18142" >&2
+      exit 7
+    fi
+    printf 'HTTP/2 502\r\n\r\n' >"$headers"
+    printf '2 502'
+    exit 0
+  }
+  snake=$(sed -E 's/([A-Z])/_\1/g; s/^_//' <<<"$method" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+  if sed -n '/^grpc_server_allow_methods = \[$/,/^]$/p' "$cfg" | grep -qx "    \"$snake\","; then code=0; fi
+  printf 'HTTP/2 200\r\ncontent-type: application/grpc\r\n\r\ngrpc-status: %s\r\n\r\n' "$code" >"$headers"
+  : >"$out"
+  [[ $write_out == '%{http_version} %{http_code}' ]] && printf '2 200'
+  exit 0
+}
+if [[ $name == "${FAKE_CURL_HOOK_NAME-}" ]]; then
+  "$FAKE_CURL_HOOK" || exit 99
+fi
+if [[ $name == "${FAKE_CURL_FAIL_NAME-}" ]]; then
+  echo "curl: (${FAKE_CURL_FAIL_CODE:-22}) simulated failure" >&2
+  emit_write_out 000
+  exit "${FAKE_CURL_FAIL_CODE:-22}"
+fi
+if [[ $name == "${FAKE_CURL_SLEEP_NAME-}" ]]; then
+  echo "$$" >"$FAKE_CURL_LOG_DIR/sleep.pid"
+  exec sleep 60
+fi
+if [[ $url == */tari.rpc.BaseNode/* ]]; then
+  grpc_answer "${orig_args[@]}"
+fi
+if [[ ! -f $path ]]; then
+  echo "curl: (22) The requested URL returned error: 404" >&2
+  emit_write_out 404
+  exit 22
+fi
+if [[ $name == "${FAKE_CURL_PARTIAL_NAME-}" ]]; then
+  head -c 10 -- "$path" | send
+  echo "curl: (18) transfer closed with outstanding read data remaining" >&2
+  emit_write_out 200
+  exit 18
+fi
+send "$path"
+emit_write_out 200

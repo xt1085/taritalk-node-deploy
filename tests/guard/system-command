@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# System-command guard for tests: the real package manager, account tools,
+# systemd, Tor, runuser and privilege tools must never run during the test
+# suite. Tests that exercise install put fakes (tests/fakes/sys) earlier in
+# PATH; anything not faked lands here and fails loudly.
+printf 'system guard: real %s is not allowed in tests: %s\n' "${0##*/}" "$*" >&2
+if [[ -n ${FAKE_SYS-} && -d $FAKE_SYS ]]; then
+  printf 'GUARD %s %s\n' "${0##*/}" "$*" >>"$FAKE_SYS/calls"
+fi
+exit 97

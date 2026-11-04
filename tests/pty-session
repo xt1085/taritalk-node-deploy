@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Run COMMAND as an SSH login would: in a new session whose controlling
+terminal is a fresh pseudo-terminal, with COMMAND in the foreground. Then
+hold a conversation with it, like a person at that terminal.
+
+Usage: pty-session TRANSCRIPT [STEP]... -- COMMAND [ARG]...
+
+STEP is `--expect TEXT` (wait until TEXT appears in the output after the
+previous match), `--send TEXT` (type TEXT; backslash escapes such as \\r,
+the Enter key, are decoded) or `--pause SECONDS` (keep reading output). After the last step, waits for COMMAND to end.
+Everything COMMAND wrote is saved to TRANSCRIPT.
+
+Exits 0 when COMMAND ended and the terminal settings are exactly what they
+were at the start; else prints why to stderr and exits:
+  3  an --expect TEXT did not appear, or COMMAND did not end, within
+     PTY_SESSION_SECONDS (default 20) seconds per step
+  4  a process of the session was stopped (state T: for example a
+     background process that read from, or reconfigured, the terminal)
+  5  COMMAND ended, but left the terminal settings changed
+COMMAND's own status is printed as `status: N` on stdout."""
+import codecs
+import os
+import pty
+import select
+import signal
+import sys
+import termios
+import time
+
+SECONDS = float(os.environ.get("PTY_SESSION_SECONDS", "20"))
+
+
+def usage():
+    sys.stderr.write(__doc__)
+    sys.exit(2)
+
+
+args = sys.argv[1:]
+if len(args) < 3 or "--" not in args:
+    usage()
+transcript_path = args.pop(0)
+steps = []
+while args and args[0] != "--":
+    if len(args) < 2 or args[0] not in ("--expect", "--send", "--pause"):
+        usage()
+    text = args[1] if args[0] == "--pause" else codecs.decode(args[1], "unicode_escape")
+    steps.append((args[0][2:], text))
+    del args[:2]
+command = args[1:]
+if not command:
+    usage()
+
+pid, master = pty.fork()
+if pid == 0:
+    try:
+        os.execvp(command[0], command)
+    finally:
+        os._exit(127)
+
+initial = termios.tcgetattr(master)
+output = b""
+seen = 0
+
+
+def save():
+    with open(transcript_path, "wb") as f:
+        f.write(output)
+
+
+def stopped_processes():
+    """Processes of the session (sid == pid) in state T."""
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as f:
+                stat = f.read().decode(errors="replace")
+        except OSError:
+            continue
+        comm = stat[stat.index("(") + 1:stat.rindex(")")]
+        fields = stat[stat.rindex(")") + 2:].split()
+        state, sid = fields[0], int(fields[3])
+        if sid == pid and state == "T":
+            found.append(f"{entry} ({comm})")
+    return found
+
+
+def give_up(code, why):
+    save()
+    sys.stderr.write(f"pty-session: {why}\n")
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    sys.exit(code)
+
+
+def pump(deadline):
+    """Read what is available until DEADLINE; False once COMMAND's side of
+    the terminal is closed."""
+    global output
+    timeout = max(0.0, min(0.2, deadline - time.monotonic()))
+    ready, _, _ = select.select([master], [], [], timeout)
+    if ready:
+        try:
+            data = os.read(master, 65536)
+        except OSError:
+            return False
+        if not data:
+            return False
+        output += data
+    stopped = stopped_processes()
+    if stopped:
+        give_up(4, "stopped process in the session: " + ", ".join(stopped))
+    return True
+
+
+open_ = True
+for kind, text in steps:
+    if kind == "send":
+        os.write(master, text.encode())
+        continue
+    if kind == "pause":
+        deadline = time.monotonic() + float(text)
+        while time.monotonic() < deadline and open_:
+            open_ = pump(deadline)
+        continue
+    deadline = time.monotonic() + SECONDS
+    while True:
+        at = output.find(text.encode(), seen)
+        if at >= 0:
+            seen = at + len(text.encode())
+            break
+        if time.monotonic() > deadline or not (open_ := pump(deadline)):
+            give_up(3, f"did not see {text!r} (the command "
+                    f"{'stopped answering' if open_ else 'ended'})")
+
+# Wait for COMMAND to end, reading its output.
+deadline = time.monotonic() + SECONDS
+while True:
+    done, status = os.waitpid(pid, os.WNOHANG)
+    if done:
+        break
+    if time.monotonic() > deadline:
+        give_up(3, "the command did not end")
+    if not pump(deadline):
+        time.sleep(0.05)
+final = termios.tcgetattr(master)
+while True:
+    ready, _, _ = select.select([master], [], [], 0)
+    if not ready:
+        break
+    try:
+        data = os.read(master, 65536)
+    except OSError:
+        break
+    if not data:
+        break
+    output += data
+save()
+print(f"status: {os.waitstatus_to_exitcode(status)}")
+if final != initial:
+    names = ["iflag", "oflag", "cflag", "lflag"]
+    changed = [n for i, n in enumerate(names) if initial[i] != final[i]]
+    sys.stderr.write("pty-session: terminal settings changed: "
+                     + (", ".join(changed) or "control characters/speed") + "\n")
+    sys.exit(5)

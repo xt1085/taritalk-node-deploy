@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Run COMMAND the way apt-get (3.0, apt-pkg/deb/dpkgpm.cc) runs dpkg, as
+far as the terminal is concerned: when its standard input is a terminal, it
+switches that terminal to raw mode (with SIGTTOU blocked, as apt does), then
+passes keys typed on it on while COMMAND runs, and at the end puts the old
+settings back (SIGTTOU not blocked). In the terminal's background, the
+reading and the final restore stop it (SIGTTIN/SIGTTOU), as they stop apt;
+killed before the restore, it leaves the terminal raw, as apt does.
+With any other standard input it only runs COMMAND.
+
+Usage: apt-tty COMMAND [ARG]...   Exits with COMMAND's status."""
+import os
+import select
+import signal
+import subprocess
+import sys
+import termios
+import tty
+
+saved = None
+if os.isatty(0):
+    saved = termios.tcgetattr(0)
+    raw = termios.tcgetattr(0)
+    tty.cfmakeraw(raw)
+    raw[3] = (raw[3] & ~termios.ECHO) | termios.ISIG
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+    termios.tcsetattr(0, termios.TCSAFLUSH, raw)
+    signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+child = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL)
+while child.poll() is None:
+    if saved is not None:
+        ready, _, _ = select.select([0], [], [], 0.1)
+        if ready:
+            os.read(0, 1024)
+    else:
+        try:
+            child.wait(0.1)
+        except subprocess.TimeoutExpired:
+            pass
+if saved is not None:
+    termios.tcsetattr(0, termios.TCSAFLUSH, saved)
+sys.exit(child.returncode)

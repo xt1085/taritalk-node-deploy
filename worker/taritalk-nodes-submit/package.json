@@ -1,0 +1,9 @@
+{
+  "name": "taritalk-nodes-submit",
+  "private": true,
+  "type": "module",
+  "description": "TariTalk Nodes one-time submission Worker (POST /submit into D1)",
+  "scripts": {
+    "test": "node --test 'test/*.test.mjs'"
+  }
+}

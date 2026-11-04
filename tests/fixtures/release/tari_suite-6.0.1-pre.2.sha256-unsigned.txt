@@ -1,0 +1,12 @@
+b7188b4fd2c1e3e0769d36c741823a187f1c0efd7c71ef5d247a8e0f9ee854f5  tari_suite-6.0.1-pre.2-esme-724c5f0-linux-riscv64.zip
+27ad0d8836b5de7cc77ec3ec2614d4ac94be2b390db78fff7990d60a310febcd  tari_suite-6.0.1-pre.2-mainnet-724c5f0-linux-riscv64.zip
+c7509c4548a1bb9aeac330a3022069dafadc26e174e93296fda59f1a02926983  tari_suite-6.0.1-pre.2-esme-724c5f0-linux-x86_64.zip
+092c39f62d77275d205d1fbeb0f370375da516d720911f0495584b3243c8d537  tari_suite-6.0.1-pre.2-mainnet-724c5f0-linux-x86_64.zip
+35a60388078070408a5def77ec56d06b71be38a93fb5a9f9ee8cca014708f328  tari_suite-6.0.1-pre.2-esme-724c5f0-linux-arm64.zip
+00410c57adcc6090bb107bbec2835981cfb03d217832ebb84ee3ebaf179d0481 *tari_suite-6.0.1-pre.2-mainnet-724c5f0-windows-x64.exe.zip
+ed4da982b886d3154e9e67a5063cda7d8804cc4a0927feaca79fc8b04d46cdc8  tari_suite-6.0.1-pre.2-mainnet-724c5f0-linux-arm64.zip
+499e335df944218d128d89a56ba0c5424df8e54866851ffc8f953c190f99f5d0  tari_suite-6.0.1-pre.2-esme-724c5f0-macos-x86_64.zip
+80f3d2510d75772105696c564520c82bf7a3f3e4eeac1079da9a5685d1456ea2  tari_suite-6.0.1-pre.2-esme-724c5f0-macos-arm64.zip
+594dbbaa28f20c29aec6ef8280917ec003f39069df6e51eae17b923ad906b1a8  tari_suite-6.0.1-pre.2-mainnet-724c5f0-macos-x86_64.zip
+3ae78066e7d976ed8ba90d917b57f5a1a09c132a8e47ca3644cc946a5c5b0a64  tari_suite-6.0.1-pre.2-mainnet-724c5f0-macos-arm64.zip
+9a7c5193af78df17b8a50a43e037a405b83c79ea137dcc2743b1dad04629434a *tari_suite-6.0.1-pre.2-esme-724c5f0-windows-x64.exe.zip

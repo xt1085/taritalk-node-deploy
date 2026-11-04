@@ -1,0 +1,35 @@
+# Written by taritalk-node-deploy (unofficial TariTalk community tool).
+[Unit]
+Description=Minotari Mainnet Tor and Clearnet Base Node
+Wants=network-online.target tor@default.service
+After=network-online.target tor@default.service
+
+[Service]
+Type=simple
+User=tari
+Group=tari
+WorkingDirectory=/var/lib/tari
+UMask=0077
+ExecStart=/opt/tari/current/minotari_node --base-path /var/lib/tari/mainnet --network mainnet --non-interactive-mode --disable-splash-screen
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=300s
+KillSignal=SIGTERM
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tari /var/log/tari
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
